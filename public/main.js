@@ -31,6 +31,7 @@ async function initAudio() {
   if (!ctx) {
     ctx = new AudioContext();
     await ctx.audioWorklet.addModule('v34-map.js'); // 先に読み込んで同じワークレットスコープに置く
+    await ctx.audioWorklet.addModule('v34-startup.js');
     await ctx.audioWorklet.addModule('modem-core.js');
     mon = ctx.createGain();
     mon.connect(ctx.destination);
@@ -175,12 +176,22 @@ function hangup(reason) {
   line(reason || 'NO CARRIER', 'warn'); rxLine = null;
 }
 
-const PHASE = { ansam: 'ANSam (2100 Hz) 送出', toneA: 'トーン A 送出', toneB: 'トーン B 送出', trn: 'TRN トレーニング', data: 'データモード', wait: '応答トーン待ち' };
+const PHASE = { S: 'フェーズ 3: S / S̄ 送出', PP: 'フェーズ 3: PP 送出', trn: 'フェーズ 3: TRN トレーニング', data: 'データモード' };
+const HS = {
+  ansam: '[tx] フェーズ 1: ANSam (2100 Hz) 送出', cm: '[tx] フェーズ 1: CM 送出 (V.21 FSK)', jm: '[tx] フェーズ 1: CM 受信 → JM 送出',
+  cj: '[tx] フェーズ 1: JM 受信 → CJ 送出', info0: '[tx] フェーズ 2: INFO0 送出 (600 bps DPSK)', probe: '[tx] フェーズ 2: L1 / L2 プロービング信号',
+  info1: '[tx] フェーズ 2: INFO1 送出',
+};
 
 function onModem(ev) {
   switch (ev.type) {
     case 'tx': if (PHASE[ev.phase]) sys(`  [tx] ${PHASE[ev.phase]}`); break;
     case 'ansam': sys('  [rx] 応答トーン検出'); break;
+    case 'hs':
+      if (ev.step === 'phase2-done') sys(`  [rx] フェーズ 2 完了: ${ev.baud} baud、往復遅延 約 ${ev.rtd.toFixed(0)} ms`);
+      else if (HS[ev.step]) sys(`  ${HS[ev.step]}`);
+      break;
+    case 'fail': hangup(`NO CARRIER (${ev.reason})`); break;
     case 'carrier': sys(ev.on ? '  [rx] キャリア検出' : '  [rx] キャリア断'); break;
     case 'connect':
       line(`CONNECT ${ev.rxBps}/${ev.txBps}  (${ev.rxBaud}/${ev.txBaud} baud, V.34 トレリス符号)`, 'warn'); rxLine = null;

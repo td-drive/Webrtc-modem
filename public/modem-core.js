@@ -19,6 +19,8 @@
 
   const V34 = root.V34 || (typeof require !== 'undefined' ? require('./v34-map.js') : null);
 
+  const SU = root.V34Startup || (typeof require !== 'undefined' ? require('./v34-startup.js') : null);
+
   const FS = 9600, SPS = 4, Q = 1; // 起動時 (2400 baud) の回線レート。Q: T/4 あたりのサンプル数
   // 回線のサンプルレートは常にシンボルレートの 4 倍。シンボルレートを上げる = サンプルを速く流す
   const SYMRATE = V34.RATES.map((r) => 2400 * r.a / r.c);
@@ -27,13 +29,17 @@
     for (let i = 0; i < n; i++) { cos[i] = Math.cos(2 * Math.PI * r.d * i / n); sin[i] = Math.sin(2 * Math.PI * r.d * i / n); }
     return { n, cos, sin };
   });
-  const GN = FS / 100, GCOEF = 2 * Math.cos(2 * Math.PI * 2100 / FS); // 2100 Hz 検出 (10 ms ブロック)
   const TXG = 0.4;                 // 送信レベル (16 bit でクリップしないよう下げる)
   const PKT = 192;                 // 回線パケット
   const ALPHA = 0.1, SPAN = 24, NTAPS = SPAN * SPS + 1; // 3429 baud でも 4 kHz 未満に収まる狭いロールオフ
   // コンテナ (非標準): 同期語 32 + ヘッダ 16 + V.34 マッピングフレーム 144 個
   const SF_LEN = 1200, SYNC_LEN = 32, MODE_LEN = 16, HDR = SYNC_LEN + MODE_LEN;
   const FRAMES = (SF_LEN - HDR) / 8;
+  // フェーズ 3 の前置き (V.34 10.1.3): S 128T、S̄ 16T、PP 288T、TRN 512T、J 16T
+  const LEAD = [128, 144, 432, 944, 960];
+  const PP_R = new Float64Array(48), PP_I = new Float64Array(48);
+  for (let i = 0; i < 48; i++) { const k = i >> 2, I = i & 3, th = Math.PI * (k * I + (k % 3 === 1 ? 4 : 0)) / 6; PP_R[i] = Math.cos(th); PP_I[i] = Math.sin(th); }
+  const TRN4 = [[-1, -1], [-1, 1], [1, 1], [1, -1]].map(([a, b]) => [a * Math.SQRT1_2, b * Math.SQRT1_2]);
   const GUARD = 64;                // シンボルレート切り替え時の無音 (シンボル数)
   const SNR_MARGIN = 7.5, SNR_HYST = 2; // 必要 SNR ≒ 3.01 × (bit/シンボル) + 余裕
   const NT = 16, CENTER = 8, LOOKAHEAD = 2 * (NT - 1 - CENTER);
@@ -112,7 +118,7 @@
       this.txSymR = new Float64Array(SPAN + 1); this.txSymI = new Float64Array(SPAN + 1);
       this.txPh = 0; this.txCar = 0; this.txPos = 0;
       this.txS = 0; this.txSPending = 0; this.txAnn = 0; this.txFs = FS; this.guardLeft = 0;
-      this.txRate = 0; this.txRatePending = 0; this.txP = null; this.trnCount = 0; this.inData = false;
+      this.txRate = 0; this.txRatePending = 0; this.txP = null; this.trnCount = 0; this.inData = false; this.leadPos = 0; this.su = null;
       this.enc = new V34.Encoder(); this.txFrame = new Int16Array(16);
       this.txBitFn = () => this.txScr(this.inData ? this.hdlcNextBit() : 1);
       this.txSr = 0; this.txTap = 18;
@@ -145,9 +151,6 @@
       this.rxWant = -1; this.peerForS = -1; this.rateForS = -1; this.expectS = -1; this.rateReq = false; this.rateToken = 0; this.rateReqSentAt = -9;
       this.rateAckPending = null; this.rateAcked = false; this.peerRate = false; this.connected = false;
       this.stat = { framesOk: 0, fcsErr: 0, retx: 0 };
-      // --- tone detector ---
-      this.g1 = 0; this.g2 = 0; this.gE = 0; this.gN = 0; this.ansCount = 0; this.ansOff = 0;
-      this.ansDetected = false; this.ansEnded = false;
     }
 
     now() { return this.time; }
@@ -169,9 +172,8 @@
       if (maxS >= 0 && maxS <= 5) this.maxS = maxS;
       this.txTap = role === 'call' ? 18 : 5;
       this.rxTap = role === 'call' ? 5 : 18;
-      this.seq = role === 'answer'
-        ? [['sil', 0.4], ['ansam', 2.0], ['sil', 0.075], ['tone', 0.5, 2400], ['sil', 0.05], ['qam', 0]]
-        : [['wait', 0], ['sil', 0.1], ['tone', 0.5, 1200], ['sil', 0.05], ['qam', 0]];
+      this.su = new SU.Startup(role, this.maxS, (ev) => this.onEvent(ev));
+      this.seq = [['startup', 0], ['qam', 0]];
       this.segIdx = -1;
       this.nextSeg();
     }
@@ -194,34 +196,30 @@
     // ================= TX =================
     nextSeg() {
       const s = this.seq[++this.segIdx];
-      this.segType = s[0]; this.segLeft = Math.round(s[1] * FS); this.segN = 0; this.segF = s[2] || 0;
-      if (s[0] === 'qam') { this.txPos = 0; this.txPh = 0; this.trnCount = 0; this.inData = false; this.txSr = 0; }
-      this.onEvent({ type: 'tx', phase: s[0] === 'tone' ? (s[2] === 2400 ? 'toneA' : 'toneB') : s[0] === 'qam' ? 'trn' : s[0] });
+      this.segType = s[0]; this.segLeft = s[1];
+      if (s[0] === 'qam') { this.txPos = 0; this.txPh = 0; this.trnCount = 0; this.inData = false; this.txSr = 0; this.leadPos = 0; }
+    }
+
+    startupDone() { // フェーズ 2 で決まったシンボルレートでフェーズ 3 へ
+      const S = this.su.S;
+      this.txS = this.rxS = this.rxNextS = this.txSPending = this.txAnn = S;
+      this.txFs = 4 * SYMRATE[S]; this.txCar = 0; this.rxCar = 0;
+      // 応答側が先にトレーニング信号を出し、発呼側はその分だけ待ってから出す
+      if (this.role === 'call') this.seq = [['startup', 0], ['sil', 4 * LEAD[4]], ['qam', 0]];
+      this.nextSeg();
     }
 
     txSample() {
-      let o = 0;
       switch (this.segType) {
-        case 'idle': return 0;
         case 'qam': return this.qamSample();
-        case 'wait':
-          if (this.ansEnded || this.locked) this.nextSeg();
-          return 0;
-        case 'tone': {
-          const half = (this.segN + this.segLeft) >> 1; // 中間で位相反転
-          o = 0.2 * (this.segN >= half ? -1 : 1) * Math.sin(2 * Math.PI * this.segF * this.segN / FS);
-          break;
+        case 'startup': {
+          const o = this.su.tx();
+          if (this.su.done) { if (this.su.failed) this.segType = 'idle'; else this.startupDone(); }
+          return o;
         }
-        case 'ansam': {
-          const rev = Math.floor(this.segN / (0.45 * FS)) & 1 ? -1 : 1;
-          o = 0.2 * rev * (1 + 0.2 * Math.sin(2 * Math.PI * 15 * this.segN / FS)) *
-            Math.sin(2 * Math.PI * 2100 * this.segN / FS);
-          break;
-        }
+        case 'sil': if (--this.segLeft <= 0) this.nextSeg(); return 0;
       }
-      this.segN++;
-      if (--this.segLeft <= 0) this.nextSeg();
-      return o;
+      return 0;
     }
 
     qamSample() {
@@ -245,6 +243,20 @@
       if (this.guardLeft > 0) { // シンボルレート切り替え前の無音。終わったら搬送波と回線レートを替える
         this.txSymR[0] = 0; this.txSymI[0] = 0;
         if (--this.guardLeft === 0) { this.txS = this.txAnn; this.txCar = 0; this.txFs = 4 * SYMRATE[this.txS]; }
+        return;
+      }
+      if (this.leadPos < LEAD[4]) { // フェーズ 3 の前置き
+        const k = this.leadPos++;
+        let r, i;
+        if (k < LEAD[1]) { const sg = k < LEAD[0] ? 1 : -1; r = k & 1 ? sg : 0; i = k & 1 ? 0 : sg; if (k === 0) this.onEvent({ type: 'tx', phase: 'S' }); }
+        else if (k < LEAD[2]) { r = PP_R[(k - LEAD[1]) % 48]; i = PP_I[(k - LEAD[1]) % 48]; if (k === LEAD[1]) this.onEvent({ type: 'tx', phase: 'PP' }); }
+        else {
+          if (k === LEAD[2]) this.onEvent({ type: 'tx', phase: 'trn' });
+          const j = k - LEAD[3], bit = (n) => (j < 0 ? 1 : (0x8990 >> ((2 * j + n) & 15)) & 1); // TRN はスクランブルした 1、J は 16 bit パターン
+          const b0 = this.txScr(bit(0)), b1 = this.txScr(bit(1));
+          [r, i] = TRN4[(b1 << 1) | b0];
+        }
+        this.txSymR[0] = r; this.txSymI[0] = i;
         return;
       }
       const pos = this.txPos;
@@ -382,21 +394,7 @@
 
     // ================= RX =================
     rxSample(s) {
-      // 2100 Hz 検出 (Goertzel, 10 ms ブロック)
-      if (!this.ansEnded) {
-        const g0 = s + GCOEF * this.g1 - this.g2;
-        this.g2 = this.g1; this.g1 = g0; this.gE += s * s;
-        if (++this.gN === GN) {
-          const p = this.g1 * this.g1 + this.g2 * this.g2 - GCOEF * this.g1 * this.g2;
-          const hit = this.gE > 0.01 && p > 0.5 * (GN / 2) * this.gE;
-          this.g1 = this.g2 = this.gE = 0; this.gN = 0;
-          if (!this.ansDetected) {
-            if (hit) { if (++this.ansCount >= 25) { this.ansDetected = true; this.onEvent({ type: 'ansam' }); } }
-            else if (this.ansCount > 0) this.ansCount -= 2;
-          } else if (hit) this.ansOff = 0;
-          else if (++this.ansOff >= 4) this.ansEnded = true;
-        }
-      }
+      if (this.su && !this.su.done) { this.su.rx(s); return; } // 起動手順の間は V.8 / フェーズ 2 の受信機へ
       // ダウンコンバート + 整合フィルタ (T/4 ごとに出力)
       const c = this.rxCar;
       const car = CARS[this.rxS];

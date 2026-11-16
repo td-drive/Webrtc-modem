@@ -11,7 +11,7 @@ function run(name, { snrDb, slipsAt = [], seconds = 25, gain = 1, loss = 0 }) {
   const mk = (k) => new Modem((ev) => {
     if (ev.type === 'data') rx[k].push(...ev.bytes);
     else if (ev.type === 'stats') { if (last[k] && ev.resyncs !== last[k].resyncs) log[k].push('resync@' + (n0 / FS).toFixed(1)); last[k] = ev; }
-    else log[k].push(`${ev.type}${ev.phase ? ':' + ev.phase : ''}${ev.txBps ? ` tx${ev.txBps}/rx${ev.rxBps}` : ''}`);
+    else log[k].push(`${ev.type}${ev.phase ? ':' + ev.phase : ''}${ev.step ? ':' + ev.step : ''}${ev.rtd >= 0 ? ` S=${ev.baud} rtd=${ev.rtd.toFixed(1)}ms` : ''}${ev.reason ? ' ' + ev.reason : ''}${ev.txBps ? ` tx${ev.txBps}/rx${ev.rxBps}` : ''}`);
   });
   const A = mk('a'), B = mk('b');
   A.start('answer'); B.start('call');
