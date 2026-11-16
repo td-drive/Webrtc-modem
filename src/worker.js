@@ -40,9 +40,36 @@ export class Room extends DurableObject {
   }
 }
 
+// TURN: Cloudflare Realtime の TURN キーが設定されていれば、短命の認証情報を発行して返す。
+// 設定: wrangler secret put TURN_KEY_ID / TURN_KEY_API_TOKEN
+const STUN = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+async function ice(env) {
+  let iceServers = STUN, turn = '未設定 (STUN のみ)';
+  if (env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN) {
+    try {
+      const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${env.TURN_KEY_API_TOKEN}`, 'Content-Type': 'application/json' },
+        body: json({ ttl: 86400 }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const list = [].concat((await r.json()).iceServers || []) // 配列でも単一オブジェクトでも受ける
+        .map((s) => ({ ...s, urls: [].concat(s.urls || []).filter((u) => !/:53(\?|$)/.test(u)) })) // ブラウザは 53 番を拒否する
+        .filter((s) => s.urls.length);
+      if (!list.some((s) => s.credential)) throw new Error('no TURN credential in response');
+      iceServers = list; turn = '有効';
+    } catch (e) {
+      turn = `エラー (${e.message}) STUN のみ`;
+    }
+  }
+  return new Response(json({ iceServers, turn }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
+    if (url.pathname === '/ice') return ice(env);
     if (url.pathname !== '/ws') return new Response('not found', { status: 404 });
     if (req.headers.get('Upgrade') !== 'websocket') return new Response('expected websocket', { status: 426 });
     const room = (url.searchParams.get('room') || '').replace(/\D/g, '').slice(0, 32);

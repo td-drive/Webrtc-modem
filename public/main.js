@@ -75,8 +75,22 @@ function preferCodec() {
   for (const t of pc.getTransceivers()) if (t.setCodecPreferences) t.setCodecPreferences(first.concat(rest));
 }
 
-function makePc() {
-  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+const STUN = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+async function getIce() { // サーバが TURN を設定していれば一時的な認証情報付きで返ってくる
+  try {
+    const j = await (await fetch('/ice', { cache: 'no-store' })).json();
+    sys(`  [ice] TURN: ${j.turn}`);
+    return j.iceServers && j.iceServers.length ? j.iceServers : STUN;
+  } catch (e) {
+    sys('  [ice] TURN: 取得失敗 (STUN のみ)');
+    return STUN;
+  }
+}
+
+function makePc(iceServers) {
+  pc = new RTCPeerConnection({ iceServers });
+  pc.oniceconnectionstatechange = () => { if (pc && !started) sys(`  [ice] ${pc.iceConnectionState}`); };
   const dest = ctx.createMediaStreamDestination();
   dest.channelCount = 1;
   node.connect(dest);
@@ -95,6 +109,10 @@ function makePc() {
       started = true;
       const stats = await pc.getStats();
       stats.forEach((s) => {
+        if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') {
+          const l = stats.get(s.localCandidateId), r = stats.get(s.remoteCandidateId);
+          if (l && r) sys(`  [ice] 経路: ${l.candidateType === 'relay' || r.candidateType === 'relay' ? 'TURN 中継' : '直接'} (${l.candidateType}/${r.candidateType})`);
+        }
         if (s.type === 'outbound-rtp' && s.codecId) {
           const c = stats.get(s.codecId);
           if (c) $('s-codec').textContent = c.mimeType.replace('audio/', '');
@@ -103,6 +121,8 @@ function makePc() {
       // ジッタバッファが落ち着くのを少し待ってからハンドシェイク開始
       setTimeout(() => node && node.port.postMessage({ type: 'start', role }), role === 'answer' ? 800 : 0);
       setState('HANDSHAKE');
+    } else if (pc.connectionState === 'failed' && !started) {
+      hangup('NO CARRIER (ICE 接続失敗: 経路が見つかりません)');
     } else if (['failed', 'closed', 'disconnected'].includes(pc.connectionState) && started) {
       hangup('NO CARRIER');
     }
@@ -131,7 +151,9 @@ async function go(r) {
   await initAudio();
   if (role === 'call') { sys(`ATDT${room}`); setState('DIALING'); await dtmf(room); }
   else { sys('ATS0=1'); sys(`着信待ち: ${room}`); setState('WAITING'); }
-  makePc();
+  const iceServers = await getIce();
+  if ($('hangup').disabled) return; // 取得中に切断された
+  makePc(iceServers);
   const sock = ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?room=${room}&mode=${role}`);
   // シグナリングが接続確立前に切れたら中止。確立後は P2P なので切れても通話は続く
   sock.onclose = () => { if (ws === sock && !started) hangup('NO DIALTONE'); };

@@ -17,6 +17,17 @@ WebRTC の音声チャネルに QAM モデム信号を流してテキストを�
 - `src/worker.js` シグナリング (Cloudflare Workers + Durable Objects, WebSocket)
 - `wrangler.toml` Workers の設定。`public/` は静的アセットとして配信される
 
+## TURN (NAT 越えできない環境向け)
+
+`RING` のあと進まない場合は TURN 中継が必要。Cloudflare ダッシュボードの Realtime → TURN で
+TURN キーを作成し、表示される 2 つの値を Worker のシークレットに登録する。
+
+    npx wrangler secret put TURN_KEY_ID
+    npx wrangler secret put TURN_KEY_API_TOKEN
+
+登録後は接続時のログに `[ice] TURN: 有効` と表示される。ローカル (`npm run dev`) で使う場合は
+`.dev.vars` に同じ 2 行を `KEY=値` 形式で書く。
+
 ## V.34 との対応
 
 | 項目 | V.34 | この実装 |
