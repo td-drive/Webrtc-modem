@@ -38,6 +38,10 @@
     <button id="answer">着信待ち</button>
     <button id="dial">発信</button>
     <button id="hangup" disabled>切断</button>
+    <select id="baud" aria-label="最大シンボルレート">
+      <option value="5">3429 baud</option><option value="4">3200 baud</option><option value="3">3000 baud</option>
+      <option value="2">2800 baud</option><option value="1">2743 baud</option><option value="0">2400 baud</option>
+    </select>
     <label><input type="checkbox" id="speaker" checked>スピーカー</label>
   </header>
   <section>
@@ -54,7 +58,7 @@
         <dt>送信</dt><dd id="s-tx">–</dd>
         <dt>受信</dt><dd id="s-rx">–</dd>
         <dt>SNR</dt><dd id="s-snr">–</dd>
-        <dt>回線</dt><dd>9600 Hz PCM</dd>
+        <dt>ボーレート</dt><dd id="s-baud">–</dd>
         <dt>パケット欠落</dt><dd id="s-lost">0</dd>
         <dt>再同期</dt><dd id="s-resync">0</dd>
         <dt>FCS エラー</dt><dd id="s-fcs">0</dd>

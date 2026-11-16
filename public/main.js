@@ -18,7 +18,7 @@ const sys = (t) => { rxLine = null; line(t, 'sys'); };
 const setState = (s) => { $('s-state').textContent = s; };
 
 function setUi(busy) {
-  for (const id of ['answer', 'dial', 'number']) $(id).disabled = busy;
+  for (const id of ['answer', 'dial', 'number', 'baud']) $(id).disabled = busy;
   $('hangup').disabled = !busy;
 }
 function setOnline(on) {
@@ -30,6 +30,7 @@ function setOnline(on) {
 async function initAudio() {
   if (!ctx) {
     ctx = new AudioContext();
+    await ctx.audioWorklet.addModule('v34-map.js'); // 先に読み込んで同じワークレットスコープに置く
     await ctx.audioWorklet.addModule('modem-core.js');
     mon = ctx.createGain();
     mon.connect(ctx.destination);
@@ -37,7 +38,7 @@ async function initAudio() {
   await ctx.resume();
   mon.gain.value = $('speaker').checked ? 0.5 : 0;
   node = new AudioWorkletNode(ctx, 'v34ish-modem', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
-  node.port.onmessage = (e) => { if (e.data.type === 'pkt') sendPacket(e.data.seq, e.data.buf); else onModem(e.data); };
+  node.port.onmessage = (e) => { if (e.data.type === 'pkt') sendPacket(e.data.seq, e.data.s, e.data.buf); else onModem(e.data); };
   node.connect(mon);
 }
 
@@ -81,22 +82,23 @@ function setLine(ch) {
     started = true;
     setState('HANDSHAKE');
     // 応答側は相手の受信準備を少し待ってから応答トーンを出す
-    setTimeout(() => node && node.port.postMessage({ type: 'start', role }), role === 'answer' ? 800 : 0);
+    setTimeout(() => node && node.port.postMessage({ type: 'start', role, maxS: +$('baud').value }), role === 'answer' ? 800 : 0);
   };
-  dc.onmessage = (e) => { // [seq:u32][int16 × 192]
-    if (!node || e.data.byteLength < 6) return;
-    const seq = new DataView(e.data).getUint32(0, true);
-    const buf = e.data.slice(4);
-    node.port.postMessage({ type: 'pkt', seq, buf }, [buf]);
+  dc.onmessage = (e) => { // [seq:u32][シンボルレート番号:u8][int16 × 192]
+    if (!node || e.data.byteLength < 7) return;
+    const v = new DataView(e.data), seq = v.getUint32(0, true), s = v.getUint8(4);
+    const buf = e.data.slice(5);
+    node.port.postMessage({ type: 'pkt', seq, s, buf }, [buf]);
   };
   dc.onclose = () => { if (pc && started) hangup('NO CARRIER'); };
 }
 
-function sendPacket(seq, buf) {
+function sendPacket(seq, s, buf) {
   if (!dc || dc.readyState !== 'open' || dc.bufferedAmount > 65536) return; // 詰まったら捨てる
-  const out = new Uint8Array(4 + buf.byteLength);
+  const out = new Uint8Array(5 + buf.byteLength);
   new DataView(out.buffer).setUint32(0, seq, true);
-  out.set(new Uint8Array(buf), 4);
+  out[4] = s;
+  out.set(new Uint8Array(buf), 5);
   dc.send(out);
 }
 
@@ -181,7 +183,7 @@ function onModem(ev) {
     case 'ansam': sys('  [rx] 応答トーン検出'); break;
     case 'carrier': sys(ev.on ? '  [rx] キャリア検出' : '  [rx] キャリア断'); break;
     case 'connect':
-      line(`CONNECT ${ev.rxBps}/${ev.txBps}`, 'warn'); rxLine = null;
+      line(`CONNECT ${ev.rxBps}/${ev.txBps}  (${ev.rxBaud}/${ev.txBaud} baud, V.34 トレリス符号)`, 'warn'); rxLine = null;
       setState('ONLINE'); setOnline(true);
       if ($('speaker').checked) mon.gain.setTargetAtTime(0, ctx.currentTime, 0.2); // ATM1: 接続後は消音
       break;
@@ -197,6 +199,7 @@ function onModem(ev) {
     }
     case 'stats':
       $('s-tx').textContent = `${ev.txBps} bps`; $('s-rx').textContent = `${ev.rxBps} bps`;
+      $('s-baud').textContent = `${ev.rxBaud} / ${ev.txBaud}`;
       $('s-snr').textContent = ev.snr ? `${ev.snr.toFixed(1)} dB` : '–';
       $('s-lost').textContent = ev.lost; $('s-resync').textContent = ev.resyncs; $('s-fcs').textContent = ev.fcsErr; $('s-retx').textContent = ev.retx;
       drawScope(ev.pts);
@@ -206,7 +209,7 @@ function onModem(ev) {
 }
 
 function drawScope(pts) {
-  const c = $('scope'), g = c.getContext('2d'), w = c.width, s = w / 2.8;
+  const c = $('scope'), g = c.getContext('2d'), w = c.width, s = w / 3.6;
   g.fillStyle = '#0b0f0c'; g.fillRect(0, 0, w, w);
   g.strokeStyle = '#24382a'; g.beginPath(); g.moveTo(w / 2, 0); g.lineTo(w / 2, w); g.moveTo(0, w / 2); g.lineTo(w, w / 2); g.stroke();
   g.fillStyle = '#b9f5c4';

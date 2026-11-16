@@ -3,41 +3,46 @@
  * DOM 非依存。AudioWorklet と Node (テスト) の両方で動く。
  *
  * V.34 から借りているもの:
- *   - シンボルレート 2400 baud / 搬送波 1800 Hz
+ *   - 6 種類のシンボルレート (2400〜3429 baud) と搬送波周波数
+ *   - データモードの符号化 (シェルマッピング + 16 状態 4D トレリス符号、v34-map.js)
  *   - 自己同期スクランブラ (発呼 1+x^-18+x^-23, 応答 1+x^-5+x^-23)
  *   - ANSam 応答トーン (2100 Hz, 15 Hz AM, 450 ms 位相反転), トーン A/B
  *   - TRN (スクランブルした 1 の 4 点信号) による等化器トレーニング
  * V.34 と違うもの:
- *   - シェルマッピング / トレリス符号 / プリコーディング / 回線プロービングなし
+ *   - 起動手順は簡略版 (V.8 の CM/JM、回線プロービング、MP シーケンスなし)
+ *   - プリコーディングと非線形符号化なし
  *   - 0.5 秒ごとに同期語を挿入するスーパーフレーム構造 (パケット欠落後の復帰用)
  * 回線は WebRTC DataChannel で 9600 Hz / 16 bit のサンプル列をそのまま運ぶ。
  */
 (function (root) {
   'use strict';
 
-  const FS = 9600, BAUD = 2400, SPS = 4, Q = 1; // Q: T/4 あたりのサンプル数
-  const CAR_N = 16;                // 1800 Hz は 16 サンプルで 3 周期
+  const V34 = root.V34 || (typeof require !== 'undefined' ? require('./v34-map.js') : null);
+
+  const FS = 9600, SPS = 4, Q = 1; // 起動時 (2400 baud) の回線レート。Q: T/4 あたりのサンプル数
+  // 回線のサンプルレートは常にシンボルレートの 4 倍。シンボルレートを上げる = サンプルを速く流す
+  const SYMRATE = V34.RATES.map((r) => 2400 * r.a / r.c);
+  const CARS = V34.RATES.map((r) => { // 搬送波 = S·d/e → 1 サンプルあたり d/(4e) 周
+    const n = 4 * r.e, cos = new Float64Array(n), sin = new Float64Array(n);
+    for (let i = 0; i < n; i++) { cos[i] = Math.cos(2 * Math.PI * r.d * i / n); sin[i] = Math.sin(2 * Math.PI * r.d * i / n); }
+    return { n, cos, sin };
+  });
   const GN = FS / 100, GCOEF = 2 * Math.cos(2 * Math.PI * 2100 / FS); // 2100 Hz 検出 (10 ms ブロック)
   const TXG = 0.4;                 // 送信レベル (16 bit でクリップしないよう下げる)
-  const PKT = 192;                 // 回線パケット: 20 ms
-  const ALPHA = 0.25, SPAN = 8, NTAPS = SPAN * SPS + 1;
-  const SF_LEN = 1200, SYNC_LEN = 32, MODE_LEN = 8, HDR = SYNC_LEN + MODE_LEN;
-  const PAYLOAD = SF_LEN - HDR;
-  const MODE_BITS = [2, 4, 6, 8];  // QPSK, 16/64/256-QAM
-  const SNR_UP = [-99, 21, 27.5, 33.5], SNR_HYST = 2.5;
+  const PKT = 192;                 // 回線パケット
+  const ALPHA = 0.1, SPAN = 24, NTAPS = SPAN * SPS + 1; // 3429 baud でも 4 kHz 未満に収まる狭いロールオフ
+  // コンテナ (非標準): 同期語 32 + ヘッダ 16 + V.34 マッピングフレーム 144 個
+  const SF_LEN = 1200, SYNC_LEN = 32, MODE_LEN = 16, HDR = SYNC_LEN + MODE_LEN;
+  const FRAMES = (SF_LEN - HDR) / 8;
+  const GUARD = 64;                // シンボルレート切り替え時の無音 (シンボル数)
+  const SNR_MARGIN = 7.5, SNR_HYST = 2; // 必要 SNR ≒ 3.01 × (bit/シンボル) + 余裕
   const NT = 16, CENTER = 8, LOOKAHEAD = 2 * (NT - 1 - CENTER);
   const RING = 2048, MASK = RING - 1;
   const SYNC_THR = 0.6;
-  const WINDOW = 8, RTO = 1.5, MAX_INFO = 64;
+  const WINDOW = 16, RTO = 1.5, MAX_INFO = 128;
   const T_I = 1, T_RR = 2, T_RATE = 3, T_RACK = 4;
 
   // ---- テーブル ----
-  const COS = new Float64Array(CAR_N), SIN = new Float64Array(CAR_N);
-  for (let i = 0; i < CAR_N; i++) {
-    COS[i] = Math.cos(2 * Math.PI * 3 * i / CAR_N);
-    SIN[i] = Math.sin(2 * Math.PI * 3 * i / CAR_N);
-  }
-
   const RRC = new Float64Array(NTAPS);
   (function () {
     let e = 0;
@@ -69,13 +74,14 @@
     }
   })();
 
-  // 変調モード表示語: ±(1+j)/√2 の Walsh 符号
-  const WALSH = [
-    [1, 1, 1, 1, 1, 1, 1, 1], [1, -1, 1, -1, 1, -1, 1, -1],
-    [1, 1, -1, -1, 1, 1, -1, -1], [1, -1, -1, 1, 1, -1, -1, 1],
-  ];
+  // ヘッダ語: 4 bit を長さ 8 の双直交符号 (Hadamard の行 × ±1) にして ±(1+j)/√2 で送る
+  const H8 = [];
+  for (let i = 0; i < 8; i++) { H8.push([]); for (let j = 0; j < 8; j++) { let v = i & j, p = 0; while (v) { p ^= v & 1; v >>= 1; } H8[i].push(p ? -1 : 1); } }
 
-  const CONST = MODE_BITS.map((b) => {
+  const bpsOf = (S, n) => (n > 0 ? 2400 * n : Math.round(2 * SYMRATE[S])); // n = 0 は無符号化 4 点 (起動・交渉用)
+  function validRate(S, n) { while (n > 0 && !V34.params(S, n)) n--; return n; }
+
+  const CONST = [2].map((b) => {
     const h = b / 2, L = 1 << h, norm = 1 / Math.sqrt(2 * (L * L - 1) / 3);
     const g2i = new Int32Array(L);
     for (let i = 0; i < L; i++) g2i[i ^ (i >> 1)] = i;
@@ -99,13 +105,16 @@
   class Modem {
     constructor(onEvent) {
       this.onEvent = onEvent || (() => {});
-      this.n = 0;
+      this.n = 0; this.time = 0; this.maxS = 5;
       this.role = null;
       // --- TX ---
       this.seq = []; this.segIdx = -1; this.segType = 'idle'; this.segLeft = 0; this.segN = 0;
       this.txSymR = new Float64Array(SPAN + 1); this.txSymI = new Float64Array(SPAN + 1);
       this.txPh = 0; this.txCar = 0; this.txPos = 0;
-      this.txMode = 0; this.txModePending = 0; this.trnCount = 0; this.inData = false;
+      this.txS = 0; this.txSPending = 0; this.txAnn = 0; this.txFs = FS; this.guardLeft = 0;
+      this.txRate = 0; this.txRatePending = 0; this.txP = null; this.trnCount = 0; this.inData = false;
+      this.enc = new V34.Encoder(); this.txFrame = new Int16Array(16);
+      this.txBitFn = () => this.txScr(this.inData ? this.hdlcNextBit() : 1);
       this.txSr = 0; this.txTap = 18;
       this.tb = new Uint8Array(8192); this.tbPos = 0; this.tbLen = 0;
       // --- RX front end ---
@@ -123,7 +132,9 @@
       this.syncErr = 0; this.syncCnt = 0;
       this.mseEma = -1; this.mseHist = []; this.goodSf = 0; this.resyncs = 0;
       this.modeYr = new Float64Array(MODE_LEN); this.modeYi = new Float64Array(MODE_LEN);
-      this.rxMode = 0; this.rxSr = 0; this.rxTap = 5;
+      this.rxS = 0; this.rxNextS = 0; this.rxRate = -1; this.rxP = null; this.rxSr = 0; this.rxTap = 5;
+      this.switching = false; this.everLocked = false; this.hunt = 0;
+      this.dec = new V34.Decoder((b) => this.rxDescr(b), FRAMES);
       this.pts = [];
       // --- HDLC RX ---
       this.hOnes = 0; this.hIn = false; this.hBits = new Uint8Array(4096); this.hN = 0;
@@ -131,7 +142,7 @@
       // --- link ---
       this.txData = []; this.unacked = []; this.resendIdx = 0;
       this.vs = 0; this.va = 0; this.vr = 0; this.ackPending = false;
-      this.rxWant = -1; this.rateReq = false; this.rateToken = 0; this.rateReqSentAt = -9;
+      this.rxWant = -1; this.peerForS = -1; this.rateForS = -1; this.expectS = -1; this.rateReq = false; this.rateToken = 0; this.rateReqSentAt = -9;
       this.rateAckPending = null; this.rateAcked = false; this.peerRate = false; this.connected = false;
       this.stat = { framesOk: 0, fcsErr: 0, retx: 0 };
       // --- tone detector ---
@@ -139,10 +150,23 @@
       this.ansDetected = false; this.ansEnded = false;
     }
 
-    now() { return this.n / FS; }
+    now() { return this.time; }
 
-    start(role) {
+    txScr(bit) {
+      const s = this.txSr, o = bit ^ ((s >> (this.txTap - 1)) & 1) ^ ((s >> 22) & 1);
+      this.txSr = ((s << 1) | o) & 0x7fffff;
+      return o;
+    }
+
+    rxDescr(bit) {
+      const s = this.rxSr;
+      this.rxSr = ((s << 1) | bit) & 0x7fffff;
+      this.hdlcRxBit(bit ^ ((s >> (this.rxTap - 1)) & 1) ^ ((s >> 22) & 1));
+    }
+
+    start(role, maxS) {
       this.role = role;
+      if (maxS >= 0 && maxS <= 5) this.maxS = maxS;
       this.txTap = role === 'call' ? 18 : 5;
       this.rxTap = role === 'call' ? 5 : 18;
       this.seq = role === 'answer'
@@ -159,12 +183,12 @@
       for (let i = 0; i < len; i++) {
         this.rxSample(inp ? inp[i] : 0);
         out[i] = this.txSample();
-        this.n++;
+        this.n++; this.time += 1 / this.txFs;
       }
     }
 
     // 送信はローカルクロックで、受信は回線からサンプルが届いた時に進める
-    txBlock(out, len) { for (let i = 0; i < len; i++) { out[i] = this.txSample(); this.n++; } }
+    txBlock(out, len) { for (let i = 0; i < len; i++) { out[i] = this.txSample(); this.n++; this.time += 1 / this.txFs; } }
     rxBlock(inp, len) { for (let i = 0; i < len; i++) this.rxSample(inp[i]); }
 
     // ================= TX =================
@@ -210,38 +234,44 @@
       for (let k = 0, idx = this.txPh; idx < NTAPS; k++, idx += SPS) {
         xr += sr[k] * RRC[idx]; xi += si[k] * RRC[idx];
       }
-      const o = TXG * (xr * COS[this.txCar] - xi * SIN[this.txCar]);
-      this.txCar = (this.txCar + 1) % CAR_N;
+      const car = CARS[this.txS];
+      const o = TXG * (xr * car.cos[this.txCar] - xi * car.sin[this.txCar]);
+      this.txCar = (this.txCar + 1) % car.n;
       this.txPh = (this.txPh + 1) % SPS;
       return o;
     }
 
     nextSymbol() {
+      if (this.guardLeft > 0) { // シンボルレート切り替え前の無音。終わったら搬送波と回線レートを替える
+        this.txSymR[0] = 0; this.txSymI[0] = 0;
+        if (--this.guardLeft === 0) { this.txS = this.txAnn; this.txCar = 0; this.txFs = 4 * SYMRATE[this.txS]; }
+        return;
+      }
       const pos = this.txPos;
       if (pos === 0) {
         if (!this.inData) {
           if (this.trnCount >= 3) { this.inData = true; this.onEvent({ type: 'tx', phase: 'data' }); }
           else this.trnCount++;
         }
-        this.txMode = this.inData ? this.txModePending : 0;
+        this.txRate = this.inData ? validRate(this.txS, this.txRatePending) : 0;
+        this.txP = this.txRate ? V34.params(this.txS, this.txRate) : null;
+        if (this.txP) { this.enc.configure(this.txP); this.enc.resetFrames(); }
+        this.txAnn = this.inData ? Math.min(this.txSPending, this.maxS) : this.txS; // 次のコンテナのシンボルレート
       }
       if (pos < SYNC_LEN) { this.txSymR[0] = SYNC_R[pos]; this.txSymI[0] = SYNC_I[pos]; }
       else if (pos < HDR) {
-        const w = WALSH[this.txMode][pos - SYNC_LEN] * Math.SQRT1_2;
+        const k = pos - SYNC_LEN, nib = k < 8 ? this.txRate : this.txAnn;
+        const w = H8[nib & 7][k & 7] * (nib & 8 ? -1 : 1) * Math.SQRT1_2;
         this.txSymR[0] = w; this.txSymI[0] = w;
-      } else {
-        const c = CONST[this.txMode];
-        let v = 0;
-        for (let b = 0; b < c.bits; b++) {
-          const bit = this.inData ? this.hdlcNextBit() : 1;
-          const s = this.txSr;
-          const o = bit ^ ((s >> (this.txTap - 1)) & 1) ^ ((s >> 22) & 1);
-          this.txSr = ((s << 1) | o) & 0x7fffff;
-          v = (v << 1) | o;
-        }
+      } else if (this.txP) { // V.34 データモード: マッピングフレーム単位で符号化
+        const fi = (pos - HDR) & 7;
+        if (fi === 0) this.enc.frame(this.txBitFn, this.txFrame);
+        this.txSymR[0] = this.txFrame[2 * fi] * this.txP.scale; this.txSymI[0] = this.txFrame[2 * fi + 1] * this.txP.scale;
+      } else { // 無符号化 4 点 (TRN と交渉用)
+        const c = CONST[0], v = (this.txBitFn() << 1) | this.txBitFn();
         this.txSymR[0] = c.re[v]; this.txSymI[0] = c.im[v];
       }
-      this.txPos = (pos + 1) % SF_LEN;
+      if (pos === SF_LEN - 1) { this.txPos = 0; if (this.txAnn !== this.txS) this.guardLeft = GUARD; } else this.txPos = pos + 1;
     }
 
     // ---- HDLC TX ----
@@ -284,11 +314,11 @@
       const now = this.now();
       if (this.rateAckPending !== null) {
         const t = this.rateAckPending; this.rateAckPending = null;
-        return [T_RACK, t, this.vr];
+        return [T_RACK, t, this.vr, Math.min(this.txSPending, this.maxS)];
       }
       if (this.rateReq && now - this.rateReqSentAt > 0.7) {
         this.rateReqSentAt = now;
-        return [T_RATE, this.rateToken, this.vr, this.rxWant];
+        return [T_RATE, this.rateToken, this.vr, this.rxWant, this.maxS, this.rateForS];
       }
       const un = this.unacked;
       if (un.length && this.resendIdx >= un.length && now - un[0].sentAt > RTO) {
@@ -324,22 +354,28 @@
           this.onEvent({ type: 'data', bytes: Array.prototype.slice.call(buf, 3, len) });
         }
         this.ackPending = true;
-      } else if (type === T_RATE && len >= 4) {
-        this.txModePending = Math.max(0, Math.min(3, buf[3]));
+      } else if (type === T_RATE && len >= 6) {
+        this.txRatePending = Math.min(14, buf[3]);
+        this.txSPending = Math.min(5, buf[4]);
+        this.peerForS = buf[5];
         this.rateAckPending = ns;
         this.peerRate = true;
         this.linkCheck();
-      } else if (type === T_RACK) {
-        if (ns === this.rateToken && this.rateReq) { this.rateReq = false; this.rateAcked = true; this.linkCheck(); }
+      } else if (type === T_RACK && len >= 4) {
+        this.expectS = Math.min(5, buf[3]); // 相手が実際に使うシンボルレート
+        if (ns === this.rateToken && this.rateReq) { this.rateReq = false; this.rateAcked = true; }
+        this.linkCheck();
       }
     }
 
+    // 双方向とも「シンボルレート切り替え済み + そのレートで選んだ速度が合意済み」になったら接続完了
     linkCheck() {
-      if (!(this.rateAcked && this.peerRate)) return;
-      const ev = {
-        type: this.connected ? 'rate' : 'connect',
-        txBps: MODE_BITS[this.txModePending] * BAUD, rxBps: MODE_BITS[Math.max(0, this.rxWant)] * BAUD,
-      };
+      const txTarget = Math.min(this.txSPending, this.maxS);
+      if (!(this.rateAcked && this.peerRate && this.rxS === this.expectS && this.rateForS === this.rxS && this.txS === txTarget && this.peerForS === this.txS)) return;
+      const tx = bpsOf(this.txS, validRate(this.txS, this.txRatePending)), rx = bpsOf(this.rxS, this.rxWant);
+      if (this.connected && tx === this.lastTx && rx === this.lastRx) return;
+      this.lastTx = tx; this.lastRx = rx;
+      const ev = { type: this.connected ? 'rate' : 'connect', txBps: tx, rxBps: rx, txBaud: V34.RATES[this.txS].name, rxBaud: V34.RATES[this.rxS].name };
       this.connected = true;
       this.onEvent(ev);
     }
@@ -363,8 +399,9 @@
       }
       // ダウンコンバート + 整合フィルタ (T/4 ごとに出力)
       const c = this.rxCar;
-      const zr = 2 / TXG * s * COS[c], zi = -2 / TXG * s * SIN[c];
-      this.rxCar = (c + 1) % CAR_N;
+      const car = CARS[this.rxS];
+      const zr = 2 / TXG * s * car.cos[c], zi = -2 / TXG * s * car.sin[c];
+      this.rxCar = (c + 1) % car.n;
       const p = this.zp;
       this.zr[p] = this.zr[p + NTAPS] = zr; this.zi[p] = this.zi[p + NTAPS] = zi;
       this.zp = (p + 1) % NTAPS;
@@ -376,6 +413,9 @@
       const t = ++this.tq;
       this.qr[t & MASK] = mr; this.qi[t & MASK] = mi;
       this.correlate(t);
+      // 切り替え後や同期喪失後に見つからなければ、他のシンボルレートも順に探す
+      if (this.locked) this.hunt = 0;
+      else if (this.everLocked && ++this.hunt > 6 * SF_LEN) { this.hunt = 0; this.rxS = (this.rxS + 1) % 6; this.rxCar = 0; }
       while (this.locked && t >= this.nextSymT + LOOKAHEAD) { this.processSymbol(); this.nextSymT += 4; }
     }
 
@@ -408,16 +448,18 @@
         if (Math.abs(d) <= 1 && !bad) { this.peakSeen = true; return; }
         this.resyncs++;
       } else {
-        this.onEvent({ type: 'carrier', on: true });
+        if (!this.switching) this.onEvent({ type: 'carrier', on: true });
+        this.switching = false; this.everLocked = true;
       }
+      this.dec.restart(); this.rxRate = -1; // 復号をやり直す
       // (再)同期: 「中央タップ初期化」と「直前の良好なタップを位相補正したもの」を
       // それぞれ同期語でトレーニングし、誤差の小さい方を採用する
       const avail = Math.min(SYNC_LEN, Math.floor((this.tq - LOOKAHEAD - sfStart) / 4) + 1);
       const g2 = pk.cr * pk.cr + pk.ci * pk.ci;
       this.wr.fill(0); this.wi.fill(0);
       this.wr[CENTER] = pk.cr / g2; this.wi[CENTER] = -pk.ci / g2;
-      let best = this.trainSync(sfStart, avail);
-      if (this.snapOk) {
+      const eA = this.trainSync(sfStart, avail, true);
+      if (this.snapOk) { // 良好だった時のタップに位相補正だけ掛けたもの。十分合っていればこちらを使う
         const ar = Float64Array.from(this.wr), ai = Float64Array.from(this.wi);
         let nr = 0, ni = 0, den = 0;
         this.wr.set(this.snapR); this.wi.set(this.snapI);
@@ -432,7 +474,7 @@
           const a = this.snapR[j], b = this.snapI[j];
           this.wr[j] = a * nr - b * ni; this.wi[j] = a * ni + b * nr;
         }
-        if (this.trainSync(sfStart, avail) > best) { this.wr.set(ar); this.wi.set(ai); }
+        if (this.trainSync(sfStart, avail, false) > 1.5 * eA + 0.005) { this.wr.set(ar); this.wi.set(ai); }
       }
       this.locked = true; this.rxPos = 0; this.nextSymT = sfStart;
       this.peakSeen = true; this.missCount = 0; this.fresh = true;
@@ -440,20 +482,22 @@
       this.hIn = false; this.hOnes = 0;
     }
 
-    trainSync(sfStart, avail) {
-      for (let pass = 0; pass < 8; pass++) {
+    // 同期語での平均二乗誤差を返す (train なら先に数回学習する)。無音の区間は数えない
+    trainSync(sfStart, avail, train) {
+      for (let pass = 0; train && pass < 8; pass++) {
         for (let k = 0; k < avail; k++) {
           this.eqOut(sfStart + 4 * k);
           this.eqUpdate(SYNC_R[k] - this.yr, SYNC_I[k] - this.yi, 0.2);
         }
       }
-      let e = 0;
+      let e = 0, n = 0;
       for (let k = 0; k < avail; k++) {
         this.eqOut(sfStart + 4 * k);
+        if (this.xp < 2) continue;
         const er = SYNC_R[k] - this.yr, ei = SYNC_I[k] - this.yi;
-        e += er * er + ei * ei;
+        e += er * er + ei * ei; n++;
       }
-      return e;
+      return n ? e / n : 1;
     }
 
     // 同期語の誤差がこれを超えたら等化器が壊れたとみなす
@@ -487,12 +531,12 @@
       if (pos === SYNC_LEN) {
         if (this.peakSeen) this.missCount = 0;
         else if (++this.missCount >= 3) {
-          this.locked = false; this.mseEma = -1; this.mseHist = []; this.goodSf = 0;
+          this.locked = false; this.mseEma = -1; this.mseHist = []; this.goodSf = 0; this.dec.restart(); this.rxRate = -1;
           this.onEvent({ type: 'carrier', on: false });
           return;
         }
         this.peakSeen = false;
-        if (!this.fresh && this.syncErr / SYNC_LEN < 0.02) {
+        if (!this.fresh && this.syncCnt === SYNC_LEN && this.syncErr / SYNC_LEN < 0.02) {
           this.snapR.set(this.wr); this.snapI.set(this.wi); this.snapOk = true;
         }
       }
@@ -501,37 +545,54 @@
       if (pos < SYNC_LEN) {
         if (pos === 0) { this.syncErr = 0; this.syncCnt = 0; }
         const er = SYNC_R[pos] - yr, ei = SYNC_I[pos] - yi;
-        this.syncErr += er * er + ei * ei; this.syncCnt++;
+        if (this.xp >= 2) { this.syncErr += er * er + ei * ei; this.syncCnt++; } // 欠落パケットの無音は数えない
         this.eqUpdate(er, ei, this.fresh ? 0.3 : 0.05);
       } else if (pos < HDR) {
         const k = pos - SYNC_LEN;
         this.modeYr[k] = yr; this.modeYi[k] = yi;
         const dr = yr >= 0 ? Math.SQRT1_2 : -Math.SQRT1_2, di = yi >= 0 ? Math.SQRT1_2 : -Math.SQRT1_2;
         this.eqUpdate(dr - yr, di - yi, 0.02);
-        if (k === MODE_LEN - 1) {
-          let best = -1e9, bm = 0;
-          for (let m = 0; m < 4; m++) {
-            let acc = 0;
-            for (let i = 0; i < MODE_LEN; i++) acc += (this.modeYr[i] + this.modeYi[i]) * WALSH[m][i];
-            if (acc > best) { best = acc; bm = m; }
-          }
-          this.rxMode = bm;
-        }
+        if (k === MODE_LEN - 1) this.onHeader();
+      } else if (this.rxP) { // V.34 データモード: ビタビ復号器へ
+        const g = this.rxP.scale, ur = yr / g, ui = yi / g;
+        this.dec.push(ur, ui);
+        // 等化器の追従は仮判定 (最寄りの奇数格子点) でごく弱く行う。主な適応は同期語
+        this.eqUpdate((2 * Math.round((ur - 1) / 2) + 1) * g - yr, (2 * Math.round((ui - 1) / 2) + 1) * g - yi, 0.005);
+        if ((pos & 7) === 0) this.pts.push(yr, yi);
       } else {
-        const c = CONST[this.rxMode], L1 = c.L - 1;
-        let ii = Math.round((yr / c.norm + L1) / 2), iq = Math.round((yi / c.norm + L1) / 2);
-        ii = ii < 0 ? 0 : ii > L1 ? L1 : ii; iq = iq < 0 ? 0 : iq > L1 ? L1 : iq;
-        this.eqUpdate((2 * ii - L1) * c.norm - yr, (2 * iq - L1) * c.norm - yi, 0.02);
-        const v = ((ii ^ (ii >> 1)) << c.h) | (iq ^ (iq >> 1));
-        for (let b = c.bits - 1; b >= 0; b--) {
-          const bit = (v >> b) & 1, s = this.rxSr;
-          const o = bit ^ ((s >> (this.rxTap - 1)) & 1) ^ ((s >> 22) & 1);
-          this.rxSr = ((s << 1) | bit) & 0x7fffff;
-          this.hdlcRxBit(o);
-        }
+        const c = CONST[0];
+        const ii = yr >= 0 ? 1 : 0, iq = yi >= 0 ? 1 : 0;
+        this.eqUpdate((2 * ii - 1) * c.norm - yr, (2 * iq - 1) * c.norm - yi, 0.02);
+        this.rxDescr(ii); this.rxDescr(iq);
         if ((pos & 7) === 0) this.pts.push(yr, yi);
       }
       if (pos === SF_LEN - 1) { this.endSuperframe(); this.rxPos = 0; } else this.rxPos = pos + 1;
+    }
+
+    onHeader() { // ヘッダ: このコンテナのデータレートと、次のコンテナのシンボルレート
+      const nib = [0, 0];
+      let sure = true;
+      for (let h = 0; h < 2; h++) {
+        let best = 0, bi = 0;
+        for (let i = 0; i < 8; i++) {
+          let acc = 0;
+          for (let j = 0; j < 8; j++) acc += (this.modeYr[h * 8 + j] + this.modeYi[h * 8 + j]) * H8[i][j];
+          if (Math.abs(acc) > Math.abs(best)) { best = acc; bi = i; }
+        }
+        nib[h] = bi | (best < 0 ? 8 : 0);
+        if (Math.abs(best) < 0.6 * 8 * Math.SQRT2) sure = false; // 無音や壊れた受信では信用しない
+      }
+      let rate = this.rxRate < 0 ? 0 : this.rxRate, nextS = this.rxS;
+      if (sure && nib[0] <= 14 && nib[1] <= 5 && (nib[0] === 0 || V34.params(this.rxS, nib[0]))) { rate = nib[0]; nextS = nib[1]; }
+      else if (this.rxRate < 0) sure = false;
+      if (rate !== this.rxRate) {
+        if (this.rxRate > 0) this.dec.flush(); // 前のレートの未確定分を出し切る
+        this.dec.restart();
+        this.rxP = rate ? V34.params(this.rxS, rate) : null;
+        if (this.rxP) this.dec.configure(this.rxP);
+        this.rxRate = rate;
+      }
+      this.rxNextS = nextS;
     }
 
     endSuperframe() {
@@ -545,19 +606,30 @@
       this.fresh = false;
       const snr = this.mseEma > 0 ? -10 * Math.log10(this.mseEma) : 0;
       if (this.goodSf >= 3) {
-        let want = Math.max(0, this.rxWant);
-        while (want < 3 && snr >= SNR_UP[want + 1]) want++;
-        while (want > 0 && snr < SNR_UP[want] - SNR_HYST) want--;
-        if (want !== this.rxWant) {
-          this.rxWant = want; this.rateReq = true; this.rateAcked = false;
+        const S = this.rxS;
+        let want = 0;
+        for (let n = 14; n >= 1; n--) {
+          if (!V34.params(S, n)) continue;
+          const need = 3.01 * (2400 * n / SYMRATE[S]) + SNR_MARGIN - (n <= this.rxWant ? SNR_HYST : 0);
+          if (snr >= need) { want = n; break; }
+        }
+        if (want !== this.rxWant || this.rateForS !== S) {
+          this.rxWant = want; this.rateForS = S; this.rateReq = true; this.rateAcked = false;
           this.rateToken = (this.rateToken + 1) & 255; this.rateReqSentAt = -9;
         }
       }
       this.onEvent({
-        type: 'stats', snr, rxBps: MODE_BITS[this.rxMode] * BAUD, txBps: MODE_BITS[this.txMode] * BAUD,
+        type: 'stats', snr, rxBps: bpsOf(this.rxS, Math.max(0, this.rxRate)), txBps: bpsOf(this.txS, this.txRate),
+        rxBaud: V34.RATES[this.rxS].name, txBaud: V34.RATES[this.txS].name,
         pts: this.pts, resyncs: this.resyncs, framesOk: this.stat.framesOk, fcsErr: this.stat.fcsErr,
         retx: this.stat.retx, queued: this.txData.length,
       });
+      this.linkCheck();
+      if (this.rxNextS !== this.rxS) { // 相手がシンボルレートを替える: 無音の間に搬送波を替えて同期語を探し直す
+        if (this.rxRate > 0) this.dec.flush();
+        this.rxRate = -1; this.rxS = this.rxNextS; this.rxCar = 0;
+        this.locked = false; this.switching = true; this.cand = null;
+      }
       this.pts = [];
     }
 
@@ -598,7 +670,7 @@
   if (typeof AudioWorkletProcessor !== 'undefined') {
     // スピーカー用: 9600 Hz のサンプル列を再生レートへ線形補間で引き上げるリング
     class MonRing {
-      constructor(step) { this.buf = new Float32Array(8192); this.w = 0; this.r = 0; this.step = step; this.run = false; }
+      constructor(step) { this.step = step; this.buf = new Float32Array(8192); this.w = 0; this.r = 0; this.run = false; }
       push(x, len) { for (let i = 0; i < len; i++) { this.buf[this.w & 8191] = x[i]; this.w++; } }
       read() {
         const fill = this.w - this.r;
@@ -617,17 +689,17 @@
       constructor() {
         super();
         this.m = null;
-        this.step = FS / sampleRate; this.acc = 0;
+        this.acc = 0;
         this.tmp = new Float32Array(256); this.rxf = new Float32Array(PKT);
         this.pkt = new Int16Array(PKT); this.pn = 0; this.txSeq = 0;
         this.rxSeq = -1; this.lost = 0;
-        this.monTx = new MonRing(this.step); this.monRx = new MonRing(this.step);
+        this.monTx = new MonRing(FS / sampleRate); this.monRx = new MonRing(FS / sampleRate);
         this.port.onmessage = (e) => {
           const d = e.data;
           if (d.type === 'start') {
             this.m = new Modem((ev) => { if (ev.type === 'stats') ev.lost = this.lost; this.port.postMessage(ev); });
-            this.m.start(d.role);
-          } else if (d.type === 'pkt' && this.m) this.onPacket(d.seq, new Int16Array(d.buf));
+            this.m.start(d.role, d.maxS);
+          } else if (d.type === 'pkt' && this.m) { this.monRx.step = 4 * SYMRATE[d.s % 6] / sampleRate; this.onPacket(d.seq, new Int16Array(d.buf)); }
           else if (d.type === 'send' && this.m) this.m.send(d.bytes);
           else if (d.type === 'stop') this.m = null;
         };
@@ -653,7 +725,8 @@
       process(inputs, outputs) {
         const out = outputs[0][0];
         if (!this.m || !out) return true;
-        this.acc += out.length * this.step;
+        this.monTx.step = this.m.txFs / sampleRate;
+        this.acc += out.length * this.monTx.step;
         const k = Math.floor(this.acc); this.acc -= k;
         this.m.txBlock(this.tmp, k);
         this.monTx.push(this.tmp, k);
@@ -662,7 +735,7 @@
           this.pkt[this.pn++] = Math.round(v * 32767);
           if (this.pn === PKT) {
             const buf = this.pkt.buffer.slice(0);
-            this.port.postMessage({ type: 'pkt', seq: this.txSeq++, buf }, [buf]);
+            this.port.postMessage({ type: 'pkt', seq: this.txSeq++, s: this.m.txS, buf }, [buf]);
             this.pn = 0;
           }
         }

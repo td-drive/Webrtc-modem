@@ -4,7 +4,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "node test/sim.js",
+    "test": "node test/v34map.js && node test/sim.js",
     "test:e2e": "node test/e2e.js"
   },
   "devDependencies": {
