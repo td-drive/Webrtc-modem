@@ -9,14 +9,17 @@
  *   - TRN (スクランブルした 1 の 4 点信号) による等化器トレーニング
  * V.34 と違うもの:
  *   - シェルマッピング / トレリス符号 / プリコーディング / 回線プロービングなし
- *   - WebRTC のジッタバッファによるサンプル滑りに耐えるため、
- *     0.5 秒ごとに同期語を挿入するスーパーフレーム構造
+ *   - 0.5 秒ごとに同期語を挿入するスーパーフレーム構造 (パケット欠落後の復帰用)
+ * 回線は WebRTC DataChannel で 9600 Hz / 16 bit のサンプル列をそのまま運ぶ。
  */
 (function (root) {
   'use strict';
 
-  const FS = 48000, BAUD = 2400, SPS = 20, Q = 5; // Q: T/4 あたりのサンプル数
-  const CAR_N = 80;                // 1800 Hz は 80 サンプルで 3 周期
+  const FS = 9600, BAUD = 2400, SPS = 4, Q = 1; // Q: T/4 あたりのサンプル数
+  const CAR_N = 16;                // 1800 Hz は 16 サンプルで 3 周期
+  const GN = FS / 100, GCOEF = 2 * Math.cos(2 * Math.PI * 2100 / FS); // 2100 Hz 検出 (10 ms ブロック)
+  const TXG = 0.4;                 // 送信レベル (16 bit でクリップしないよう下げる)
+  const PKT = 192;                 // 回線パケット: 20 ms
   const ALPHA = 0.25, SPAN = 8, NTAPS = SPAN * SPS + 1;
   const SF_LEN = 1200, SYNC_LEN = 32, MODE_LEN = 8, HDR = SYNC_LEN + MODE_LEN;
   const PAYLOAD = SF_LEN - HDR;
@@ -151,7 +154,7 @@
 
     send(bytes) { for (let i = 0; i < bytes.length; i++) this.txData.push(bytes[i]); }
 
-    process(inp, out) {
+    process(inp, out) { // テスト用: 送受信を同じクロックで回す
       const len = out.length;
       for (let i = 0; i < len; i++) {
         this.rxSample(inp ? inp[i] : 0);
@@ -159,6 +162,10 @@
         this.n++;
       }
     }
+
+    // 送信はローカルクロックで、受信は回線からサンプルが届いた時に進める
+    txBlock(out, len) { for (let i = 0; i < len; i++) { out[i] = this.txSample(); this.n++; } }
+    rxBlock(inp, len) { for (let i = 0; i < len; i++) this.rxSample(inp[i]); }
 
     // ================= TX =================
     nextSeg() {
@@ -182,7 +189,7 @@
           break;
         }
         case 'ansam': {
-          const rev = Math.floor(this.segN / 21600) & 1 ? -1 : 1;
+          const rev = Math.floor(this.segN / (0.45 * FS)) & 1 ? -1 : 1;
           o = 0.2 * rev * (1 + 0.2 * Math.sin(2 * Math.PI * 15 * this.segN / FS)) *
             Math.sin(2 * Math.PI * 2100 * this.segN / FS);
           break;
@@ -203,7 +210,7 @@
       for (let k = 0, idx = this.txPh; idx < NTAPS; k++, idx += SPS) {
         xr += sr[k] * RRC[idx]; xi += si[k] * RRC[idx];
       }
-      const o = xr * COS[this.txCar] - xi * SIN[this.txCar];
+      const o = TXG * (xr * COS[this.txCar] - xi * SIN[this.txCar]);
       this.txCar = (this.txCar + 1) % CAR_N;
       this.txPh = (this.txPh + 1) % SPS;
       return o;
@@ -341,11 +348,11 @@
     rxSample(s) {
       // 2100 Hz 検出 (Goertzel, 10 ms ブロック)
       if (!this.ansEnded) {
-        const g0 = s + 1.9243776 * this.g1 - this.g2; // 2cos(2π·2100/48000)
+        const g0 = s + GCOEF * this.g1 - this.g2;
         this.g2 = this.g1; this.g1 = g0; this.gE += s * s;
-        if (++this.gN === 480) {
-          const p = this.g1 * this.g1 + this.g2 * this.g2 - 1.9243776 * this.g1 * this.g2;
-          const hit = this.gE > 0.05 && p > 0.5 * 240 * this.gE;
+        if (++this.gN === GN) {
+          const p = this.g1 * this.g1 + this.g2 * this.g2 - GCOEF * this.g1 * this.g2;
+          const hit = this.gE > 0.01 && p > 0.5 * (GN / 2) * this.gE;
           this.g1 = this.g2 = this.gE = 0; this.gN = 0;
           if (!this.ansDetected) {
             if (hit) { if (++this.ansCount >= 25) { this.ansDetected = true; this.onEvent({ type: 'ansam' }); } }
@@ -356,7 +363,7 @@
       }
       // ダウンコンバート + 整合フィルタ (T/4 ごとに出力)
       const c = this.rxCar;
-      const zr = 2 * s * COS[c], zi = -2 * s * SIN[c];
+      const zr = 2 / TXG * s * COS[c], zi = -2 / TXG * s * SIN[c];
       this.rxCar = (c + 1) % CAR_N;
       const p = this.zp;
       this.zr[p] = this.zr[p + NTAPS] = zr; this.zi[p] = this.zi[p + NTAPS] = zi;
@@ -467,6 +474,7 @@
     }
 
     eqUpdate(er, ei, mu) {
+      if (this.xp < 2) return; // 無音区間 (パケット欠落) では適応しない
       const g = mu / (this.xp + 1e-9), wr = this.wr, wi = this.wi, xr = this.xr, xi = this.xi;
       for (let j = 0; j < NT; j++) {
         wr[j] += g * (er * xr[j] + ei * xi[j]);
@@ -588,23 +596,77 @@
   if (typeof module !== 'undefined' && module.exports) module.exports = { Modem, FS };
 
   if (typeof AudioWorkletProcessor !== 'undefined') {
+    // スピーカー用: 9600 Hz のサンプル列を再生レートへ線形補間で引き上げるリング
+    class MonRing {
+      constructor(step) { this.buf = new Float32Array(8192); this.w = 0; this.r = 0; this.step = step; this.run = false; }
+      push(x, len) { for (let i = 0; i < len; i++) { this.buf[this.w & 8191] = x[i]; this.w++; } }
+      read() {
+        const fill = this.w - this.r;
+        if (!this.run) { if (fill < 600) return 0; this.run = true; }      // 約 60 ms ためてから再生
+        if (fill < 2) { this.run = false; return 0; }
+        if (fill > 4000) this.r = this.w - 600;                             // 遅れすぎたら追いつく
+        const i = Math.floor(this.r), f = this.r - i;
+        this.r += this.step;
+        return this.buf[i & 8191] * (1 - f) + this.buf[(i + 1) & 8191] * f;
+      }
+    }
+
+    // 回線は「サンプルをそのまま運ぶデータチャネル」。受信側は届いたサンプルを順に処理するだけで、
+    // 再生クロックを持たない。欠落パケットは同じ長さの無音で埋めるので、時間軸は伸縮しない。
     class ModemProcessor extends AudioWorkletProcessor {
       constructor() {
         super();
         this.m = null;
+        this.step = FS / sampleRate; this.acc = 0;
+        this.tmp = new Float32Array(256); this.rxf = new Float32Array(PKT);
+        this.pkt = new Int16Array(PKT); this.pn = 0; this.txSeq = 0;
+        this.rxSeq = -1; this.lost = 0;
+        this.monTx = new MonRing(this.step); this.monRx = new MonRing(this.step);
         this.port.onmessage = (e) => {
           const d = e.data;
           if (d.type === 'start') {
-            if (sampleRate !== FS) { this.port.postMessage({ type: 'error', msg: 'sampleRate must be 48000' }); return; }
-            this.m = new Modem((ev) => this.port.postMessage(ev));
+            this.m = new Modem((ev) => { if (ev.type === 'stats') ev.lost = this.lost; this.port.postMessage(ev); });
             this.m.start(d.role);
-          } else if (d.type === 'send' && this.m) this.m.send(d.bytes);
+          } else if (d.type === 'pkt' && this.m) this.onPacket(d.seq, new Int16Array(d.buf));
+          else if (d.type === 'send' && this.m) this.m.send(d.bytes);
           else if (d.type === 'stop') this.m = null;
         };
       }
+
+      onPacket(seq, pcm) {
+        if (pcm.length !== PKT) return;
+        if (this.rxSeq >= 0) {
+          let gap = seq - this.rxSeq;
+          if (gap <= 0) return;                 // 遅れて届いたものは捨てる (既に無音で埋めた)
+          if (gap > 1) {
+            this.lost += gap - 1;
+            this.rxf.fill(0);
+            for (gap = Math.min(gap - 1, 100); gap > 0; gap--) { this.m.rxBlock(this.rxf, PKT); this.monRx.push(this.rxf, PKT); }
+          }
+        }
+        this.rxSeq = seq;
+        for (let i = 0; i < PKT; i++) this.rxf[i] = pcm[i] / 32768;
+        this.m.rxBlock(this.rxf, PKT);
+        this.monRx.push(this.rxf, PKT);
+      }
+
       process(inputs, outputs) {
         const out = outputs[0][0];
-        if (this.m && out) this.m.process(inputs[0] && inputs[0][0], out);
+        if (!this.m || !out) return true;
+        this.acc += out.length * this.step;
+        const k = Math.floor(this.acc); this.acc -= k;
+        this.m.txBlock(this.tmp, k);
+        this.monTx.push(this.tmp, k);
+        for (let i = 0; i < k; i++) {
+          const v = Math.max(-1, Math.min(1, this.tmp[i]));
+          this.pkt[this.pn++] = Math.round(v * 32767);
+          if (this.pn === PKT) {
+            const buf = this.pkt.buffer.slice(0);
+            this.port.postMessage({ type: 'pkt', seq: this.txSeq++, buf }, [buf]);
+            this.pn = 0;
+          }
+        }
+        for (let i = 0; i < out.length; i++) out[i] = this.monTx.read() + this.monRx.read();
         return true;
       }
     }

@@ -1,11 +1,10 @@
 // 実ブラウザ (Chromium 2 ページ) で WebRTC 越しに接続して文字を送り合う。
-// 使い方: node test/e2e.js [pcmu|opus]  (wrangler dev でローカル起動する)
+// 使い方: node test/e2e.js  (wrangler dev でローカル起動する)
 const { chromium } = require('playwright');
 const { spawn } = require('child_process');
 const path = require('path');
 
 (async () => {
-  const codec = process.argv[2] || 'pcmu';
   const PORT = 8134;
   const srv = spawn('npx', ['wrangler', 'dev', '--port', String(PORT)], { cwd: path.join(__dirname, '..'), stdio: 'ignore', detached: true });
   for (let i = 0; i < 60; i++) { // 起動待ち
@@ -19,7 +18,6 @@ const path = require('path');
       const p = await (await browser.newContext()).newPage();
       p.on('pageerror', (e) => console.log(`[${name}] pageerror`, e.message));
       await p.goto(`http://localhost:${PORT}/`);
-      await p.selectOption('#codec', codec);
       return p;
     };
     const a = await mk('A'), b = await mk('B');
@@ -44,7 +42,7 @@ const path = require('path');
       console.log(await p.evaluate(() => [...document.querySelectorAll('dl dt')].map((dt) => `${dt.textContent}=${dt.nextElementSibling.textContent}`).join('  ')));
       console.log(await p.evaluate(() => [...document.querySelectorAll('#term div')].map((d) => d.textContent.slice(0, 70)).join('\n')));
     }
-    await a.screenshot({ path: path.join(__dirname, `shot-${codec}.png`) });
+    await a.screenshot({ path: '/tmp/claude-0/-home-user-webrtc-modem/eafe2a68-e82e-5e47-b47e-b7c606203f7e/scratchpad/shot.png' });
     ok = true;
   } catch (e) {
     console.log('FAILED:', e.message.split('\n')[0]);

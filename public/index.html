@@ -38,10 +38,6 @@
     <button id="answer">着信待ち</button>
     <button id="dial">発信</button>
     <button id="hangup" disabled>切断</button>
-    <select id="codec" aria-label="音声コーデック">
-      <option value="pcmu">G.711 μ-law</option>
-      <option value="opus">Opus</option>
-    </select>
     <label><input type="checkbox" id="speaker" checked>スピーカー</label>
   </header>
   <section>
@@ -58,7 +54,8 @@
         <dt>送信</dt><dd id="s-tx">–</dd>
         <dt>受信</dt><dd id="s-rx">–</dd>
         <dt>SNR</dt><dd id="s-snr">–</dd>
-        <dt>コーデック</dt><dd id="s-codec">–</dd>
+        <dt>回線</dt><dd>9600 Hz PCM</dd>
+        <dt>パケット欠落</dt><dd id="s-lost">0</dd>
         <dt>再同期</dt><dd id="s-resync">0</dd>
         <dt>FCS エラー</dt><dd id="s-fcs">0</dd>
         <dt>再送</dt><dd id="s-retx">0</dd>
@@ -67,7 +64,6 @@
     <div class="box"><canvas id="scope" width="240" height="240" aria-label="受信コンスタレーション"></canvas></div>
   </aside>
 </main>
-<audio id="remote" muted playsinline></audio>
 <script src="main.js"></script>
 </body>
 </html>

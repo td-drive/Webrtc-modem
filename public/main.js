@@ -1,7 +1,7 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
 const term = $('term');
-let ctx, node, mon, pc, ws, room, role, started = false, online = false;
+let ctx, node, mon, pc, dc, ws, routeShown, room, role, started = false, online = false;
 const enc = new TextEncoder();
 let dec = new TextDecoder();
 let rxLine = null;
@@ -18,7 +18,7 @@ const sys = (t) => { rxLine = null; line(t, 'sys'); };
 const setState = (s) => { $('s-state').textContent = s; };
 
 function setUi(busy) {
-  for (const id of ['answer', 'dial', 'number', 'codec']) $(id).disabled = busy;
+  for (const id of ['answer', 'dial', 'number']) $(id).disabled = busy;
   $('hangup').disabled = !busy;
 }
 function setOnline(on) {
@@ -29,15 +29,15 @@ function setOnline(on) {
 
 async function initAudio() {
   if (!ctx) {
-    ctx = new AudioContext({ sampleRate: 48000 });
+    ctx = new AudioContext();
     await ctx.audioWorklet.addModule('modem-core.js');
     mon = ctx.createGain();
     mon.connect(ctx.destination);
   }
   await ctx.resume();
   mon.gain.value = $('speaker').checked ? 0.5 : 0;
-  node = new AudioWorkletNode(ctx, 'v34ish-modem', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
-  node.port.onmessage = (e) => onModem(e.data);
+  node = new AudioWorkletNode(ctx, 'v34ish-modem', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
+  node.port.onmessage = (e) => { if (e.data.type === 'pkt') sendPacket(e.data.seq, e.data.buf); else onModem(e.data); };
   node.connect(mon);
 }
 
@@ -61,20 +61,6 @@ function signal(msg) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
-function mungeOpus(sdp) { // モデム信号向け: モノラル・CBR・DTX/FEC なし
-  return sdp.replace(/a=fmtp:(\d+) (.*useinbandfec=1.*)/g, (m, pt, p) =>
-    `a=fmtp:${pt} ${p.replace('useinbandfec=1', 'useinbandfec=0')};stereo=0;cbr=1;usedtx=0;maxaveragebitrate=128000`);
-}
-
-function preferCodec() {
-  const want = $('codec').value === 'pcmu' ? 'audio/pcmu' : 'audio/opus';
-  const caps = RTCRtpReceiver.getCapabilities('audio').codecs;
-  const first = caps.filter((c) => c.mimeType.toLowerCase() === want);
-  if (!first.length) return;
-  const rest = caps.filter((c) => c.mimeType.toLowerCase() !== want);
-  for (const t of pc.getTransceivers()) if (t.setCodecPreferences) t.setCodecPreferences(first.concat(rest));
-}
-
 const STUN = [{ urls: 'stun:stun.l.google.com:19302' }];
 
 async function getIce() { // サーバが TURN を設定していれば一時的な認証情報付きで返ってくる
@@ -88,39 +74,50 @@ async function getIce() { // サーバが TURN を設定していれば一時的
   }
 }
 
+function setLine(ch) {
+  dc = ch;
+  dc.binaryType = 'arraybuffer';
+  dc.onopen = () => {
+    started = true;
+    setState('HANDSHAKE');
+    // 応答側は相手の受信準備を少し待ってから応答トーンを出す
+    setTimeout(() => node && node.port.postMessage({ type: 'start', role }), role === 'answer' ? 800 : 0);
+  };
+  dc.onmessage = (e) => { // [seq:u32][int16 × 192]
+    if (!node || e.data.byteLength < 6) return;
+    const seq = new DataView(e.data).getUint32(0, true);
+    const buf = e.data.slice(4);
+    node.port.postMessage({ type: 'pkt', seq, buf }, [buf]);
+  };
+  dc.onclose = () => { if (pc && started) hangup('NO CARRIER'); };
+}
+
+function sendPacket(seq, buf) {
+  if (!dc || dc.readyState !== 'open' || dc.bufferedAmount > 65536) return; // 詰まったら捨てる
+  const out = new Uint8Array(4 + buf.byteLength);
+  new DataView(out.buffer).setUint32(0, seq, true);
+  out.set(new Uint8Array(buf), 4);
+  dc.send(out);
+}
+
 function makePc(iceServers) {
   pc = new RTCPeerConnection({ iceServers });
   pc.oniceconnectionstatechange = () => { if (pc && !started) sys(`  [ice] ${pc.iceConnectionState}`); };
-  const dest = ctx.createMediaStreamDestination();
-  dest.channelCount = 1;
-  node.connect(dest);
-  pc.addTrack(dest.stream.getAudioTracks()[0], dest.stream);
   pc.onicecandidate = (e) => { if (e.candidate) signal({ ice: e.candidate }); };
-  pc.ontrack = (e) => {
-    const stream = e.streams[0] || new MediaStream([e.track]);
-    $('remote').srcObject = stream; // Chrome は <audio> に繋がないとリモート音声が流れない
-    $('remote').play().catch(() => {});
-    const src = ctx.createMediaStreamSource(stream);
-    src.connect(node); src.connect(mon);
-  };
+  // 回線: 順序保証なし・再送なしのデータチャネルで PCM サンプルを運ぶ
+  if (role === 'call') setLine(pc.createDataChannel('line', { ordered: false, maxRetransmits: 0 }));
+  else pc.ondatachannel = (e) => setLine(e.channel);
   pc.onconnectionstatechange = async () => {
     if (!pc) return;
-    if (pc.connectionState === 'connected' && !started) {
-      started = true;
+    if (pc.connectionState === 'connected' && !routeShown) {
+      routeShown = true;
       const stats = await pc.getStats();
       stats.forEach((s) => {
         if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') {
           const l = stats.get(s.localCandidateId), r = stats.get(s.remoteCandidateId);
           if (l && r) sys(`  [ice] 経路: ${l.candidateType === 'relay' || r.candidateType === 'relay' ? 'TURN 中継' : '直接'} (${l.candidateType}/${r.candidateType})`);
         }
-        if (s.type === 'outbound-rtp' && s.codecId) {
-          const c = stats.get(s.codecId);
-          if (c) $('s-codec').textContent = c.mimeType.replace('audio/', '');
-        }
       });
-      // ジッタバッファが落ち着くのを少し待ってからハンドシェイク開始
-      setTimeout(() => node && node.port.postMessage({ type: 'start', role }), role === 'answer' ? 800 : 0);
-      setState('HANDSHAKE');
     } else if (pc.connectionState === 'failed' && !started) {
       hangup('NO CARRIER (ICE 接続失敗: 経路が見つかりません)');
     } else if (['failed', 'closed', 'disconnected'].includes(pc.connectionState) && started) {
@@ -133,10 +130,7 @@ async function onSignal(msg) {
   if (msg.sdp) {
     await pc.setRemoteDescription(msg.sdp);
     if (msg.sdp.type === 'offer') {
-      preferCodec();
-      const ans = await pc.createAnswer();
-      ans.sdp = mungeOpus(ans.sdp);
-      await pc.setLocalDescription(ans);
+      await pc.setLocalDescription(await pc.createAnswer());
       signal({ sdp: pc.localDescription });
     }
   } else if (msg.ice) {
@@ -147,7 +141,7 @@ async function onSignal(msg) {
 async function go(r) {
   role = r; room = $('number').value.replace(/\D/g, '');
   if (!room) return;
-  setUi(true); started = false; dec = new TextDecoder();
+  setUi(true); started = false; routeShown = false; dec = new TextDecoder();
   await initAudio();
   if (role === 'call') { sys(`ATDT${room}`); setState('DIALING'); await dtmf(room); }
   else { sys('ATS0=1'); sys(`着信待ち: ${room}`); setState('WAITING'); }
@@ -164,10 +158,7 @@ async function go(r) {
     else if (m.type === 'ring') sys('RING');
     else if (m.type === 'peer-left') { if (pc && !started) hangup('NO CARRIER'); }
     else if (m.type === 'joined' && role === 'call') {
-      preferCodec();
-      const offer = await pc.createOffer();
-      offer.sdp = mungeOpus(offer.sdp);
-      await pc.setLocalDescription(offer);
+      await pc.setLocalDescription(await pc.createOffer());
       signal({ sdp: pc.localDescription });
     } else if (m.type === 'signal') onSignal(m.msg);
   };
@@ -175,9 +166,9 @@ async function go(r) {
 
 function hangup(reason) {
   if (ws) { const s = ws; ws = null; s.close(); }
+  dc = null;
   if (pc) { pc.close(); pc = null; }
   if (node) { node.port.postMessage({ type: 'stop' }); node.disconnect(); node = null; }
-  $('remote').srcObject = null;
   setOnline(false); setUi(false); setState('OFFLINE');
   line(reason || 'NO CARRIER', 'warn'); rxLine = null;
 }
@@ -207,7 +198,7 @@ function onModem(ev) {
     case 'stats':
       $('s-tx').textContent = `${ev.txBps} bps`; $('s-rx').textContent = `${ev.rxBps} bps`;
       $('s-snr').textContent = ev.snr ? `${ev.snr.toFixed(1)} dB` : '–';
-      $('s-resync').textContent = ev.resyncs; $('s-fcs').textContent = ev.fcsErr; $('s-retx').textContent = ev.retx;
+      $('s-lost').textContent = ev.lost; $('s-resync').textContent = ev.resyncs; $('s-fcs').textContent = ev.fcsErr; $('s-retx').textContent = ev.retx;
       drawScope(ev.pts);
       break;
     case 'error': line(ev.msg, 'warn'); break;
