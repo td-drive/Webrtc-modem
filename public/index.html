@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>V.34 風ダイヤルアップ over WebRTC</title>
+<style>
+  :root { --bg:#0b0f0c; --panel:#121a14; --line:#24382a; --fg:#b9f5c4; --dim:#6f9c7a; --hi:#eaffef; --warn:#ffcf70; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, "Noto Sans Mono CJK JP", monospace; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px; display:grid; gap:12px; grid-template-columns: minmax(0,1fr) 260px; }
+  header { grid-column: 1 / -1; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  h1 { font-size:16px; margin:0 12px 0 0; color:var(--hi); font-weight:600; }
+  input, select, button { font:inherit; color:var(--fg); background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:6px 10px; }
+  input:focus, select:focus, button:focus-visible { outline:1px solid var(--fg); }
+  button { cursor:pointer; color:var(--hi); }
+  button:hover:not(:disabled) { border-color:var(--fg); }
+  button:disabled, input:disabled, select:disabled { opacity:.45; cursor:default; }
+  #number { width: 11ch; }
+  #term { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px; height:60vh; min-height:280px; overflow-y:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
+  #term .sys { color:var(--dim); } #term .me { color:var(--hi); } #term .warn { color:var(--warn); }
+  form { display:flex; gap:8px; margin-top:8px; }
+  form input { flex:1; min-width:0; }
+  aside { display:flex; flex-direction:column; gap:10px; }
+  .box { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px; }
+  dl { margin:0; display:grid; grid-template-columns:auto 1fr; gap:2px 10px; }
+  dt { color:var(--dim); } dd { margin:0; text-align:right; color:var(--hi); font-variant-numeric: tabular-nums; }
+  canvas { width:100%; aspect-ratio:1; display:block; }
+  label { color:var(--dim); display:flex; gap:6px; align-items:center; }
+  @media (max-width: 720px) { main { grid-template-columns: minmax(0,1fr); } #term { height:45vh; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>V.34 風モデム / WebRTC</h1>
+    <input id="number" inputmode="numeric" placeholder="番号" value="5550134" aria-label="電話番号">
+    <button id="answer">着信待ち</button>
+    <button id="dial">発信</button>
+    <button id="hangup" disabled>切断</button>
+    <select id="codec" aria-label="音声コーデック">
+      <option value="pcmu">G.711 μ-law</option>
+      <option value="opus">Opus</option>
+    </select>
+    <label><input type="checkbox" id="speaker" checked>スピーカー</label>
+  </header>
+  <section>
+    <div id="term" aria-live="polite"></div>
+    <form id="form">
+      <input id="text" placeholder="接続後、テキストを入力して Enter" autocomplete="off" disabled>
+      <button id="sendbtn" disabled>送信</button>
+    </form>
+  </section>
+  <aside>
+    <div class="box">
+      <dl>
+        <dt>状態</dt><dd id="s-state">OFFLINE</dd>
+        <dt>送信</dt><dd id="s-tx">–</dd>
+        <dt>受信</dt><dd id="s-rx">–</dd>
+        <dt>SNR</dt><dd id="s-snr">–</dd>
+        <dt>コーデック</dt><dd id="s-codec">–</dd>
+        <dt>再同期</dt><dd id="s-resync">0</dd>
+        <dt>FCS エラー</dt><dd id="s-fcs">0</dd>
+        <dt>再送</dt><dd id="s-retx">0</dd>
+      </dl>
+    </div>
+    <div class="box"><canvas id="scope" width="240" height="240" aria-label="受信コンスタレーション"></canvas></div>
+  </aside>
+</main>
+<audio id="remote" muted playsinline></audio>
+<script src="main.js"></script>
+</body>
+</html>

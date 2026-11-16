@@ -1,0 +1,13 @@
+{
+  "name": "v34-webrtc",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node test/sim.js",
+    "test:e2e": "node test/e2e.js pcmu"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
